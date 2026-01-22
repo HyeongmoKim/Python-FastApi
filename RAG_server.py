@@ -64,8 +64,8 @@ def load_transformer_model(model_path: str):
 
 
 # 모델/스케일러 로드
-MODEL_PATH = "../results_transformer_4feat/transformer_4feat.pt"
-SCALER_PATH = "../results_transformer_4feat/scalers.json"
+MODEL_PATH = "./results_transformer_4feat/transformer_4feat.pt"
+SCALER_PATH = "./results_transformer_4feat/scalers.json"
 TF_MODEL, TF_CONFIG = load_transformer_model(MODEL_PATH)
 SCALER_DATA = load_scalers_json(SCALER_PATH) or {"x_mean": [0] * 4, "x_std": [1] * 4, "y_mean": 0, "y_std": 1}
 
