@@ -14,7 +14,7 @@ faiss-cpu==1.7.4
 transformers==4.36.0
 sentence-transformers==2.2.2
 
-# RAG 및 LLM - 버전을 유연하게 설정 (자동으로 호환되는 버전 찾기)
+# RAG 및 LLM
 langchain>=0.1.0
 langchain-openai>=0.0.5
 langchain-community>=0.0.20
@@ -23,8 +23,11 @@ langgraph>=0.0.26
 openai>=1.10.0
 tiktoken>=0.5.2
 
-# PDF 생성 및 유틸리티
+# PDF 처리
+pypdf>=4.0.0
 fpdf2>=2.7.0
+
+# 유틸리티
 python-dotenv>=1.0.0
 nest-asyncio>=1.6.0
 requests>=2.31.0
