@@ -1,0 +1,39 @@
+name: Build and Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [ "main" ]  # main 브랜치에 코드가 push될 때마다 실행됩니다.
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. GitHub 리포지토리의 코드를 체크아웃합니다.
+      - name: Checkout source code
+        uses: actions/checkout@v3
+
+      # 2. Azure에 로그인합니다. (GitHub Secrets에 저장된 AZURE_CREDENTIALS 사용)
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3. Azure Container Registry(ACR)에 로그인하고 도커 이미지를 빌드 및 푸시합니다.
+      # 이미지 태그에 github.sha를 사용하여 매 배포마다 고유한 버전을 가집니다.
+      - name: Build and push image to ACR
+        run: |
+          az acr login --name ${{ secrets.AZURE_ACR_NAME }}
+          docker build -t ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/fastapi-ai:${{ github.sha }} .
+          docker push ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/fastapi-ai:${{ github.sha }}
+
+      # 4. Azure Container Apps에 업데이트된 이미지를 배포합니다.
+      - name: Deploy to Container App
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          imageToDeploy: ${{ secrets.AZURE_ACR_NAME }}.azurecr.io/fastapi-ai:${{ github.sha }}
+          resourceGroup: RAG-Project-RG
+          containerAppName: rag-server-app
+          containerName: rag-api-container
+          # 환경 변수 설정 (OpenAI API Key 등)
+          envVars: OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
