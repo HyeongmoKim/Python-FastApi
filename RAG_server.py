@@ -187,6 +187,31 @@ async def analyze(req: Dict[str, Any]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/download/{file_name}")
+    async def download_pdf(file_name: str):
+        # 1. RAG_server.py가 실행되는 절대 경로를 잡습니다.
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # 2. analyze 함수에서 저장한 "./output"과 동일한 위치를 절대 경로로 만듭니다.
+        file_path = os.path.join(base_dir, "output", file_name)
+
+        # 3. 파일이 실제로 존재하는지 확인
+        if os.path.exists(file_path):
+            return FileResponse(
+                path=file_path,
+                filename=file_name,
+                media_type='application/pdf'
+            )
+
+        # 4. 파일이 없으면 나오는 에러 메시지 (이게 브라우저에 보였던 딕셔너리입니다)
+        return {
+            "error": "파일을 찾을 수 없습니다.",
+            "debug_info": {
+                "requested_file": file_name,
+                "checked_path": file_path
+            }
+        }
+
 if __name__ == "__main__":
     nest_asyncio.apply()
     uvicorn.run(app, host="0.0.0.0", port=9999)
