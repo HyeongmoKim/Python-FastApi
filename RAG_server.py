@@ -9,11 +9,10 @@ import numpy as np
 import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-from pyngrok import ngrok
-from fpdf import FPDF  # [수정] 오류가 잦은 md2pdf 대신 fpdf2 사용
-from fastapi.responses import FileResponse
+from fpdf import FPDF
 
 # --- 모듈 임포트 ---
 try:
@@ -25,7 +24,7 @@ except ImportError as e:
 
 
 # ==========================================
-# 0. 유틸리티 함수 및 모델 로드 로직 (기존과 동일)
+# 0. 유틸리티 함수 및 모델 로드 로직
 # ==========================================
 def parsenumber(value: Any) -> Optional[float]:
     if value is None: return None
@@ -71,7 +70,7 @@ TF_MODEL, TF_CONFIG = load_transformer_model(MODEL_PATH)
 SCALER_DATA = load_scalers_json(SCALER_PATH) or {"x_mean": [0] * 4, "x_std": [1] * 4, "y_mean": 0, "y_std": 1}
 
 
-# 어댑터 및 파이프라인 생성 (기존과 동일)
+# 어댑터 및 파이프라인 생성
 class TransformerPredictorAdapter:
     def __init__(self, model, scaler_data):
         self.model = model
@@ -116,36 +115,33 @@ rag_pipeline = BidRAGPipeline(doc_dir="./rag_corpus", index_dir="./rag_index", a
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# 환경변수로 BASE_URL 설정 (기본값은 Azure URL)
+BASE_URL = os.getenv("BASE_URL", "https://bid-prediction-api-v2.orangehill-6dfcc5e6.koreacentral.azurecontainerapps.io")
+
 
 def generate_pdf(report_text, output_path):
-    """fpdf2 OS/2 에러 완벽 해결 버전 (로컬 폰트 사용)"""
+    """fpdf2로 PDF 생성"""
     try:
         pdf = FPDF()
         pdf.add_page()
 
-        # 1. 시스템 폰트 대신 프로젝트 폴더 내의 폰트 파일을 직접 지정
-        # NanumGothic-Regular.ttf 파일을 RAG_server.py와 같은 위치에 두세요.
+        # 폰트 경로
         current_dir = os.path.dirname(os.path.abspath(__file__))
         font_path = os.path.join(current_dir, "NanumGothic-Regular.ttf")
 
-        # 만약 파일이 없다면 에러를 미리 출력하여 안내
         if not os.path.exists(font_path):
-            raise FileNotFoundError(f"폰트 파일이 없습니다: {font_path} (나눔고딕을 다운로드해 폴더에 넣어주세요)")
+            raise FileNotFoundError(f"폰트 파일이 없습니다: {font_path}")
 
-        # 2. 폰트 등록 및 설정
         pdf.add_font("Nanum", "", font_path)
         pdf.set_font("Nanum", size=11)
 
-        # 3. 텍스트 정제 (불필요한 특수기호 제거)
+        # 텍스트 정제
         clean_text = report_text.replace("#", "").replace("*", "").replace(">", "").replace("- ", "• ").strip()
-
-        # 4. 출력 (OS/2 에러 방지를 위해 latin-1 체크 우회)
-        # fpdf2의 multi_cell은 유니코드를 기본적으로 지원합니다.
         pdf.multi_cell(0, 8, txt=clean_text)
 
         pdf.output(output_path)
     except Exception as e:
-        print(f"❌ [Internal generate_pdf Error] : {e}")
+        print(f"❌ PDF 생성 에러: {e}")
         raise e
 
 
@@ -170,47 +166,43 @@ async def analyze(req: Dict[str, Any]):
                 raise ValueError("리포트 생성 실패: 마크다운 내용이 없습니다.")
 
             generate_pdf(report_md, pdf_path)
-            # 클라이언트가 접속할 수 있는 실제 URL 주소를 만듭니다.
-            # 주소 끝에 방금 생성한 pdf_filename을 붙여줍니다.
-            download_url = f"https://bid-prediction-api-v2.orangehill-6dfcc5e6.koreacentral.azurecontainerapps.io/download/{pdf_filename}"
+            download_url = f"{BASE_URL}/download/{pdf_filename}"
             print(f"✅ PDF 생성 성공: {pdf_path}")
         except Exception as e:
-            print(f"❌ PDF 생성 단계 최종 실패: {e}")
+            print(f"❌ PDF 생성 실패: {e}")
             download_url = f"PDF 생성 실패: {str(e)}"
 
         return {
             "extracted_requirements": result.get("requirements", {}),
             "prediction": result.get("prediction_result", {}),
             "report": report_md,
-            "pdf_link": download_url  # 이제 경로 대신 URL이 나갑니다!
+            "pdf_link": download_url
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    @app.get("/download/{file_name}")
-    async def download_pdf(file_name: str):
-        # 1. RAG_server.py가 실행되는 절대 경로를 잡습니다.
-        base_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 2. analyze 함수에서 저장한 "./output"과 동일한 위치를 절대 경로로 만듭니다.
-        file_path = os.path.join(base_dir, "output", file_name)
+@app.get("/download/{file_name}")
+async def download_pdf(file_name: str):
+    """PDF 파일 다운로드 엔드포인트"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, "output", file_name)
 
-        # 3. 파일이 실제로 존재하는지 확인
-        if os.path.exists(file_path):
-            return FileResponse(
-                path=file_path,
-                filename=file_name,
-                media_type='application/pdf'
-            )
+    if os.path.exists(file_path):
+        return FileResponse(
+            path=file_path,
+            filename=file_name,
+            media_type='application/pdf'
+        )
 
-        # 4. 파일이 없으면 나오는 에러 메시지 (이게 브라우저에 보였던 딕셔너리입니다)
-        return {
-            "error": "파일을 찾을 수 없습니다.",
-            "debug_info": {
-                "requested_file": file_name,
-                "checked_path": file_path
-            }
+    return {
+        "error": "파일을 찾을 수 없습니다.",
+        "debug_info": {
+            "requested_file": file_name,
+            "checked_path": file_path
         }
+    }
+
 
 if __name__ == "__main__":
     nest_asyncio.apply()
