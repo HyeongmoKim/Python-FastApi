@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from fpdf import FPDF
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # --- 모듈 임포트 ---
 try:
@@ -139,8 +139,11 @@ def upload_to_azure(file_path, file_name):
 
         # 파일 업로드
         with open(file=file_path, mode="rb") as data:
-            blob_client.upload_blob(data, overwrite=True, content_settings={'content_type': 'application/pdf'})
-
+            blob_client.upload_blob(
+                data,
+                overwrite=True,
+                content_settings=ContentSettings(content_type='application/pdf')
+            )
         blob_url = blob_client.url
         print(f"✅ Azure 업로드 성공: {blob_url}")
         return blob_url
