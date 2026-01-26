@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from pyngrok import ngrok
 from fpdf import FPDF  # [수정] 오류가 잦은 md2pdf 대신 fpdf2 사용
+from fastapi.responses import FileResponse
 
 # --- 모듈 임포트 ---
 try:
@@ -169,18 +170,19 @@ async def analyze(req: Dict[str, Any]):
                 raise ValueError("리포트 생성 실패: 마크다운 내용이 없습니다.")
 
             generate_pdf(report_md, pdf_path)
-            full_pdf_path = os.path.abspath(pdf_path)
-            print(f"✅ PDF 생성 성공: {full_pdf_path}")
+            # 클라이언트가 접속할 수 있는 실제 URL 주소를 만듭니다.
+            # 주소 끝에 방금 생성한 pdf_filename을 붙여줍니다.
+            download_url = f"https://bid-prediction-api-v2.orangehill-6dfcc5e6.koreacentral.azurecontainerapps.io/download/{pdf_filename}"
+            print(f"✅ PDF 생성 성공: {pdf_path}")
         except Exception as e:
-            # 실패 시 상세 원인을 JSON 응답에 포함
             print(f"❌ PDF 생성 단계 최종 실패: {e}")
-            full_pdf_path = f"PDF 생성 실패: {str(e)}"
+            download_url = f"PDF 생성 실패: {str(e)}"
 
         return {
             "extracted_requirements": result.get("requirements", {}),
             "prediction": result.get("prediction_result", {}),
             "report": report_md,
-            "pdf_link": full_pdf_path
+            "pdf_link": download_url  # 이제 경로 대신 URL이 나갑니다!
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
