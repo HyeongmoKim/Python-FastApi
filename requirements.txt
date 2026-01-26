@@ -36,3 +36,7 @@ pyngrok
 
 # 시각화
 matplotlib==3.8.2
+
+# Azure Blob Storage
+azure-storage-blob
+python-dotenv
