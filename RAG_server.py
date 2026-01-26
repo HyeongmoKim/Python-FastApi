@@ -7,12 +7,14 @@ import os
 import json
 import numpy as np
 import uuid
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-from fpdf import FPDF
+from pyngrok import ngrok
+from fpdf import FPDF  # [수정] 오류가 잦은 md2pdf 대신 fpdf2 사용
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 # --- 모듈 임포트 ---
 try:
@@ -24,7 +26,7 @@ except ImportError as e:
 
 
 # ==========================================
-# 0. 유틸리티 함수 및 모델 로드 로직
+# 0. 유틸리티 함수 및 모델 로드 로직 (기존과 동일)
 # ==========================================
 def parsenumber(value: Any) -> Optional[float]:
     if value is None: return None
@@ -64,13 +66,13 @@ def load_transformer_model(model_path: str):
 
 
 # 모델/스케일러 로드
-MODEL_PATH = "./results_transformer_4feat/transformer_4feat.pt"
-SCALER_PATH = "./results_transformer_4feat/scalers.json"
+MODEL_PATH = "../results_transformer_4feat/transformer_4feat.pt"
+SCALER_PATH = "../results_transformer_4feat/scalers.json"
 TF_MODEL, TF_CONFIG = load_transformer_model(MODEL_PATH)
 SCALER_DATA = load_scalers_json(SCALER_PATH) or {"x_mean": [0] * 4, "x_std": [1] * 4, "y_mean": 0, "y_std": 1}
 
 
-# 어댑터 및 파이프라인 생성
+# 어댑터 및 파이프라인 생성 (기존과 동일)
 class TransformerPredictorAdapter:
     def __init__(self, model, scaler_data):
         self.model = model
@@ -115,33 +117,57 @@ rag_pipeline = BidRAGPipeline(doc_dir="./rag_corpus", index_dir="./rag_index", a
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 환경변수로 BASE_URL 설정 (기본값은 Azure URL)
-BASE_URL = os.getenv("BASE_URL", "https://bid-prediction-api-v2.orangehill-6dfcc5e6.koreacentral.azurecontainerapps.io")
 
+# --- Azure Blob Storage 설정 ---
+load_dotenv()
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_CONTAINER_NAME = "uploads"
+
+if not AZURE_STORAGE_CONNECTION_STRING:
+    raise ValueError("❌환경변수 'AZURE_STORAGE_CONNECTION_STRING'이 설정되지 않았습니다!")
+
+def upload_to_azure(file_path, file_name):
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=file_name)
+
+        # 파일 업로드
+        with open(file=file_path, mode="rb") as data:
+            blob_client.upload_blob(data, overwrite=True, content_type="application/pdf") # 다운X 브라우저에서 바로 열람
+        return blob_client.url
+    except Exception as e:
+        print(f"Azure 업로드 실패: {e}")
+        return e
 
 def generate_pdf(report_text, output_path):
-    """fpdf2로 PDF 생성"""
+    """fpdf2 OS/2 에러 완벽 해결 버전 (로컬 폰트 사용)"""
     try:
         pdf = FPDF()
         pdf.add_page()
 
-        # 폰트 경로
+        # 1. 시스템 폰트 대신 프로젝트 폴더 내의 폰트 파일을 직접 지정
+        # NanumGothic-Regular.ttf 파일을 RAG_server.py와 같은 위치에 두세요.
         current_dir = os.path.dirname(os.path.abspath(__file__))
         font_path = os.path.join(current_dir, "NanumGothic-Regular.ttf")
 
+        # 만약 파일이 없다면 에러를 미리 출력하여 안내
         if not os.path.exists(font_path):
-            raise FileNotFoundError(f"폰트 파일이 없습니다: {font_path}")
+            raise FileNotFoundError(f"폰트 파일이 없습니다: {font_path} (나눔고딕을 다운로드해 폴더에 넣어주세요)")
 
+        # 2. 폰트 등록 및 설정
         pdf.add_font("Nanum", "", font_path)
         pdf.set_font("Nanum", size=11)
 
-        # 텍스트 정제
+        # 3. 텍스트 정제 (불필요한 특수기호 제거)
         clean_text = report_text.replace("#", "").replace("*", "").replace(">", "").replace("- ", "• ").strip()
+
+        # 4. 출력 (OS/2 에러 방지를 위해 latin-1 체크 우회)
+        # fpdf2의 multi_cell은 유니코드를 기본적으로 지원합니다.
         pdf.multi_cell(0, 8, txt=clean_text)
 
         pdf.output(output_path)
     except Exception as e:
-        print(f"❌ PDF 생성 에러: {e}")
+        print(f"❌ [Internal generate_pdf Error] : {e}")
         raise e
 
 
@@ -166,43 +192,24 @@ async def analyze(req: Dict[str, Any]):
                 raise ValueError("리포트 생성 실패: 마크다운 내용이 없습니다.")
 
             generate_pdf(report_md, pdf_path)
-            download_url = f"{BASE_URL}/download/{pdf_filename}"
-            print(f"✅ PDF 생성 성공: {pdf_path}")
+            full_pdf_path = os.path.abspath(pdf_path)
+            print(f"✅ PDF 생성 성공: {full_pdf_path}")
+
+            final_url = upload_to_azure(full_pdf_path, pdf_filename)
+            print(f"Azure 업로드 URL: {final_url}")
         except Exception as e:
-            print(f"❌ PDF 생성 실패: {e}")
-            download_url = f"PDF 생성 실패: {str(e)}"
+            # 실패 시 상세 원인을 JSON 응답에 포함
+            print(f"❌ PDF 생성 단계 최종 실패: {e}")
+            final_url = f"PDF 생성 실패: {str(e)}"
 
         return {
             "extracted_requirements": result.get("requirements", {}),
             "prediction": result.get("prediction_result", {}),
             "report": report_md,
-            "pdf_link": download_url
+            "pdf_link": final_url
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/download/{file_name}")
-async def download_pdf(file_name: str):
-    """PDF 파일 다운로드 엔드포인트"""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(base_dir, "output", file_name)
-
-    if os.path.exists(file_path):
-        return FileResponse(
-            path=file_path,
-            filename=file_name,
-            media_type='application/pdf'
-        )
-
-    return {
-        "error": "파일을 찾을 수 없습니다.",
-        "debug_info": {
-            "requested_file": file_name,
-            "checked_path": file_path
-        }
-    }
-
 
 if __name__ == "__main__":
     nest_asyncio.apply()
