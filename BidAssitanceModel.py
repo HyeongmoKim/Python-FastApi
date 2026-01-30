@@ -815,6 +815,10 @@ class BidRAGPipeline:
         # ★ 여기서 주입된 Transformer 어댑터의 predict()가 실행됨
         try:
             pred_result = self.award_predictor.predict(reqs, retrieved_context)
+            print("=" * 60)
+            print(" [DEBUG] _node_predict - 예측 완료:")
+            print(json.dumps(pred_result, indent=2, ensure_ascii=False))
+            print("=" * 60)
         except Exception as e:
             pred_result = {"error": str(e), "confidence": "low"}
 
@@ -923,7 +927,7 @@ class BidRAGPipeline:
 
         # 노드 등록
         workflow.add_node("extract", self._node_extract)
-        workflow.add_node("predict", self._node_predict)  
+        workflow.add_node("predict", self._node_predict)
         workflow.add_node("report", self._node_report)
 
         # 엣지 연결 (조건문 없이 직렬 연결)
@@ -1028,7 +1032,12 @@ class BidRAGPipeline:
 
     def _node_report(self, state: GraphState) -> GraphState:
         reqs = state.get("requirements", {})
-        pred = state.get("prediction_result", {}) # <--- 예측 결과 가져오기
+        pred = state.get("prediction_result", {})
+        print("=" * 60)
+        print(" [DEBUG] _node_report - prediction_result:")
+        print(json.dumps(pred, indent=2, ensure_ascii=False))
+        print("=" * 60)
+        # <--- 예측 결과 가져오기
 
         reqs_json = json.dumps(reqs, ensure_ascii=False)
         pred_json = json.dumps(pred, ensure_ascii=False)
@@ -1066,6 +1075,7 @@ class BidRAGPipeline:
         final_state: GraphState = self.graph.invoke(initial, config={"configurable": {"thread_id": thread_id}})
         return {
             "requirements": final_state.get("requirements", {}),
+            "prediction_result": final_state.get("prediction_result", {}),
             "report_markdown": final_state.get("report_markdown", ""),
             "messages": final_state.get("messages", []),
         }
@@ -1163,7 +1173,7 @@ if __name__ == "__main__":
     # 6. 결과 출력 (마크다운 원본도 출력하려면)
     print("\n--- Generated Report (Markdown) ---\n")
     print(markdown_content)
-    
+
     # 7. 백엔드로 전송할 정보 (JSON)
     result_json = {
         "pdf_path": pdf_path,
