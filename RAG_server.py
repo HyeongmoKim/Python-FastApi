@@ -15,7 +15,9 @@ from typing import List, Dict, Any, Optional
 from fpdf import FPDF
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from datetime import datetime
+from dotenv import load_dotenv
 
+load_dotenv()
 # --- 모듈 임포트 ---
 try:
     from BidAssitanceModel import BidRAGPipeline
