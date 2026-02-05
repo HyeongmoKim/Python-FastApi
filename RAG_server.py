@@ -14,22 +14,30 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from fpdf import FPDF
 from azure.storage.blob import BlobServiceClient, ContentSettings
+from datetime import datetime
 
 # --- 모듈 임포트 ---
 try:
-    from model_transformer import TransformerRegressor
     from BidAssitanceModel import BidRAGPipeline
+    from get_probability_from_model import ProbabilityPredictor  # ✅ TFT 모델 사용
 except ImportError as e:
     print(f"❌ 필수 모듈 로딩 실패: {e}")
     exit(1)
 
 
 # ==========================================
-# 0. 유틸리티 함수 및 모델 로드 로직
+# 0. 유틸리티 함수
 # ==========================================
 def parsenumber(value: Any) -> Optional[float]:
-    if value is None: return None
-    if isinstance(value, (int, float)): return float(value)
+    """
+    다양한 형태의 숫자 문자열을 float로 변환
+    예: "1,000,000원" -> 1000000.0
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
     s = str(value).strip()
     s = re.sub(r'[^0-9.\-]', '', s.replace(',', ''))
     try:
@@ -38,82 +46,108 @@ def parsenumber(value: Any) -> Optional[float]:
         return None
 
 
-def load_scalers_json(path: str):
-    if not os.path.exists(path): return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ==========================================
+# 1. TFT 모델 로드
+# ==========================================
+TFT_MODEL_PATH = './results_transformer/best_model.pt'
+try:
+    tft_predictor = ProbabilityPredictor(model_path=TFT_MODEL_PATH)
+    print("✅ TFT 모델 로드 성공")
+except Exception as e:
+    print(f"⚠️ TFT 모델 로드 실패: {e}")
+    tft_predictor = None
 
 
-def load_transformer_model(model_path: str):
-    if not os.path.exists(model_path):
-        return None, {"num_features": 4, "d_model": 64}
-    state_dict = torch.load(model_path, map_location='cpu')
-    config = {"num_features": 4, "d_model": 64, "num_layers": 2, "dim_feedforward": 256, "nhead": 4}
-    print(f"🛠 설정된 모델 구조: d_model={config['d_model']}, FFN={config['dim_feedforward']}")
-    model = TransformerRegressor(
-        num_features=config['num_features'], d_model=config['d_model'],
-        num_layers=config['num_layers'], nhead=config['nhead'],
-        dim_feedforward=config['dim_feedforward'], dropout=0.1
-    )
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print("🎉 Transformer 모델 로드 성공!")
-    except RuntimeError as e:
-        print(f"❌ 사이즈 에러 발생: {e}")
-    model.eval()
-    return model, config
+# ==========================================
+# 2. TFT 예측 어댑터 (top_ranges 포함)
+# ==========================================
+class TFTPredictorAdapter:
+    """RAG 파이프라인에서 사용할 TFT 모델 어댑터 - top_ranges 지원"""
 
+    def __init__(self, predictor):
+        self.predictor = predictor
 
-# 모델/스케일러 로드
-MODEL_PATH = "./results_transformer_4feat/transformer_4feat.pt"
-SCALER_PATH = "./results_transformer_4feat/scalers.json"
-TF_MODEL, TF_CONFIG = load_transformer_model(MODEL_PATH)
-SCALER_DATA = load_scalers_json(SCALER_PATH) or {"x_mean": [0] * 4, "x_std": [1] * 4, "y_mean": 0, "y_std": 1}
+    def predict(self, requirements: Dict[str, Any], retrieved_context: str = "") -> Dict[str, Any]:
+        """입찰 요구사항을 기반으로 TFT 모델로 예측 수행 - top_ranges 포함"""
+        try:
+            if not self.predictor:
+                return {
+                    "error": "Model not loaded",
+                    "point_estimate": 0,
+                    "confidence": "error",
+                    "rationale": "TFT Model not loaded"
+                }
+
+            # 입력 데이터 파싱
+            pr_range = parsenumber(requirements.get('expected_price_range')) or 0.0
+            lower_rate = parsenumber(requirements.get('award_lower_rate')) or 0.0
+            estimate = parsenumber(requirements.get('estimate_price')) or 0.0
+            budget = parsenumber(requirements.get('budget')) or 0.0
+
+            input_dict = {
+                '예가범위': pr_range,
+                '낙찰하한율': lower_rate,
+                '추정가격': estimate,
+                '기초금액': budget
+            }
+
+            # TFT 모델로 확률 높은 상위 3개 구간 예측
+            result = self.predictor.get_highest_probability_ranges(
+                input_dict,
+                bin_width=0.001,
+                top_k=3
+            )
+
+            if result and result.get("top_ranges"):
+                top_ranges = result["top_ranges"]
+
+                # 낙찰가 계산: 사정율 × 낙찰하한율 × 추정가격
+                pred_sashiritsu = float(top_ranges[0]["center"])
+                award_price = round(pred_sashiritsu * lower_rate * estimate) if (lower_rate and estimate) else None
+
+                return {
+                    "currency": "KRW",
+                    "point_estimate": award_price,                      # 원 단위 낙찰가
+                    "predicted_sashiritsu": pred_sashiritsu,            # 사정율 (최고확률)
+                    "predicted_min": float(result["statistics"]["q25"]),  # 사정율 하한 (q25)
+                    "predicted_max": float(result["statistics"]["q75"]),  # 사정율 상한 (q75)
+                    "confidence": "high",
+                    "top_ranges": top_ranges,
+                    "statistics": result["statistics"],
+                    "rationale": f"TFT Model - Top {len(top_ranges)} 확률 구간 분석 완료",
+                    "model_type": "QuantileTransformerRegressor"
+                }
+            else:
+                return {
+                    "error": "Prediction failed",
+                    "point_estimate": 0,
+                    "confidence": "low",
+                    "rationale": "TFT 예측 결과 없음"
+                }
+
+        except Exception as e:
+            print(f"❌ TFT 예측 오류: {e}")
+            return {
+                "error": str(e),
+                "point_estimate": 0,
+                "confidence": "error",
+                "rationale": f"Prediction Failed: {str(e)}"
+            }
 
 
 # 어댑터 및 파이프라인 생성
-class TransformerPredictorAdapter:
-    def __init__(self, model, scaler_data):
-        self.model = model
-        self.x_mean = np.array(scaler_data.get('x_mean', [0.0] * 4))
-        self.x_std = np.array(scaler_data.get('x_std', [1.0] * 4))
-        self.y_mean = float(scaler_data.get('y_mean', 0.0))
-        self.y_std = float(scaler_data.get('y_std', 1.0))
-        self.target_log = bool(scaler_data.get('target_log', False))
-
-    def predict(self, requirements: Dict[str, Any], retrieved_context: str = "") -> Dict[str, Any]:
-        try:
-            estimate = parsenumber(requirements.get('estimate_price')) or 1000000.0
-            budget = parsenumber(requirements.get('budget')) or estimate
-            pr_range = parsenumber(requirements.get('expected_price_range')) or 0.0
-            lower_rate = parsenumber(requirements.get('award_lower_rate')) or 0.0
-            features = np.array([budget, estimate, pr_range, lower_rate])
-            scaled_features = (features - self.x_mean) / self.x_std
-            final_pred = estimate
-            if self.model:
-                input_tensor = torch.tensor(scaled_features, dtype=torch.float32).reshape(1, -1, 1)
-                with torch.no_grad():
-                    output = self.model(input_tensor)
-                    pred_s = output[0].item() if isinstance(output, (tuple, list)) else output.item()
-                pred_log = pred_s * self.y_std + self.y_mean
-                final_pred = np.expm1(pred_log) if self.target_log else pred_log
-            point_estimate = int(round(final_pred))
-            return {
-                "currency": "KRW", "point_estimate": point_estimate,
-                "predicted_min": int(point_estimate * 0.98), "predicted_max": int(point_estimate * 1.02),
-                "confidence": "high", "rationale": "Transformer 분석 완료", "model_type": "Transformer"
-            }
-        except Exception as e:
-            return {"point_estimate": 0, "confidence": "error", "rationale": str(e)}
-
-
-adapter = TransformerPredictorAdapter(TF_MODEL, SCALER_DATA)
-rag_pipeline = BidRAGPipeline(doc_dir="./rag_corpus", index_dir="./rag_index", award_predict_fn=adapter.predict)
+adapter = TFTPredictorAdapter(tft_predictor)
+print("🚀 RAG 파이프라인 초기화...")
+rag_pipeline = BidRAGPipeline(
+    doc_dir="./rag_corpus",
+    index_dir="./rag_index",
+    award_predict_fn=adapter.predict  # ✅ TFT 어댑터 주입
+)
 
 # ==========================================
 # 3. FastAPI 서버 및 PDF 생성 로직
 # ==========================================
-app = FastAPI()
+app = FastAPI(title="Integrated Bid Prediction API with TFT")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- Azure Blob Storage 설정 ---
@@ -121,44 +155,33 @@ load_dotenv()
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 AZURE_CONTAINER_NAME = "uploads"
 
-# 환경변수가 없으면 경고만 하고 계속 진행 (로컬 테스트용)
 if not AZURE_STORAGE_CONNECTION_STRING:
-    print("⚠️ AZURE_STORAGE_CONNECTION_STRING 환경변수가 설정되지 않았습니다.")
-    print("   Azure Blob Storage 업로드는 건너뛰고 로컬 경로만 반환합니다.")
+    raise ValueError("❌환경변수 'AZURE_STORAGE_CONNECTION_STRING'이 설정되지 않았습니다!")
 
 
 def upload_to_azure(file_path, file_name):
-    """Azure Blob Storage에 PDF 업로드"""
-    if not AZURE_STORAGE_CONNECTION_STRING:
-        # 환경변수 없으면 로컬 경로 반환
-        return f"로컬 저장: ./output/{file_name} (Azure 미설정)"
-
+    """Azure Blob Storage에 파일 업로드"""
     try:
         blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
         blob_client = blob_service_client.get_blob_client(container=AZURE_CONTAINER_NAME, blob=file_name)
 
-        # 파일 업로드
         with open(file=file_path, mode="rb") as data:
-            blob_client.upload_blob(
-                data,
-                overwrite=True,
-                content_settings=ContentSettings(content_type='application/pdf')
-            )
-        blob_url = blob_client.url
-        print(f"✅ Azure 업로드 성공: {blob_url}")
-        return blob_url
+            blob_client.upload_blob(data, overwrite=True, content_type="application/pdf")
+
+        print(f"✅ Azure 업로드 성공: {blob_client.url}")
+        return blob_client.url
     except Exception as e:
         print(f"❌ Azure 업로드 실패: {e}")
-        return f"Azure 업로드 실패: {str(e)}"
+        return str(e)
 
 
 def generate_pdf(report_text, output_path):
-    """fpdf2로 PDF 생성"""
+    """fpdf2로 한글 PDF 생성"""
     try:
         pdf = FPDF()
         pdf.add_page()
 
-        # 폰트 경로
+        # 나눔고딕 폰트 로드
         current_dir = os.path.dirname(os.path.abspath(__file__))
         font_path = os.path.join(current_dir, "NanumGothic-Regular.ttf")
 
@@ -170,21 +193,28 @@ def generate_pdf(report_text, output_path):
 
         # 텍스트 정제
         clean_text = report_text.replace("#", "").replace("*", "").replace(">", "").replace("- ", "• ").strip()
-        pdf.multi_cell(0, 8, txt=clean_text)
 
+        pdf.multi_cell(0, 8, txt=clean_text)
         pdf.output(output_path)
+
         print(f"✅ PDF 생성 성공: {output_path}")
     except Exception as e:
-        print(f"❌ PDF 생성 에러: {e}")
+        print(f"❌ PDF 생성 실패: {e}")
         raise e
 
 
 @app.post("/analyze")
 async def analyze(req: Dict[str, Any]):
+    """입찰공고 분석 + TFT 예측 + PDF 생성 + Azure 업로드"""
     try:
-        # 1. 분석 수행
-        result = rag_pipeline.analyze(req.get("text", ""), thread_id=req.get("thread_id", "default"))
+        # 1. RAG 파이프라인 분석 수행
+        result = rag_pipeline.analyze(
+            req.get("text", ""),
+            thread_id=req.get("thread_id", "default")
+        )
+
         report_md = result.get("report_markdown", "")
+        prediction_result = result.get("prediction_result", {})
 
         # 2. PDF 저장 폴더 준비
         output_dir = "./output"
@@ -195,27 +225,88 @@ async def analyze(req: Dict[str, Any]):
         pdf_path = os.path.join(output_dir, pdf_filename)
 
         # 3. PDF 생성 및 Azure 업로드
+        final_url = None
         try:
             if not report_md:
                 raise ValueError("리포트 생성 실패: 마크다운 내용이 없습니다.")
 
             generate_pdf(report_md, pdf_path)
+            full_pdf_path = os.path.abspath(pdf_path)
 
-            # Azure Blob Storage에 업로드
-            final_url = upload_to_azure(pdf_path, pdf_filename)
+            final_url = upload_to_azure(full_pdf_path, pdf_filename)
 
         except Exception as e:
-            print(f"❌ PDF 처리 실패: {e}")
+            print(f"❌ PDF/Azure 처리 실패: {e}")
             final_url = f"PDF 생성 실패: {str(e)}"
 
+        # 4. 응답 반환
         return {
             "extracted_requirements": result.get("requirements", {}),
-            "prediction": result.get("prediction_result", {}),
+            "prediction": prediction_result,  # ✅ top_ranges 포함됨
             "report": report_md,
             "pdf_link": final_url
         }
+
     except Exception as e:
+        print(f"❌ /analyze 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predictBase")
+async def predict_base(req: Dict[str, List[float]]):
+    """직접 예측 API (TFT 모델)"""
+    if not tft_predictor:
+        return {"error": "TFT Model not loaded", "predBid": 0}
+
+    try:
+        features = req.get("features", [])
+        if len(features) != 4:
+            return {"error": "4개의 feature가 필요합니다", "predBid": 0}
+
+        input_dict = {
+            '예가범위': features[0],
+            '낙찰하한율': features[1],
+            '추정가격': features[2],
+            '기초금액': features[3]
+        }
+
+        result = tft_predictor.get_highest_probability_ranges(input_dict, bin_width=0.001, top_k=3)
+
+        if result and result.get("top_ranges"):
+            top_ranges = result["top_ranges"]
+            budget = features[3]  # 기초금액
+
+            # 낙찰가 계산: 사정율 × 낙찰하한율 × 추정가격
+            lower_rate = features[1]   # 낙찰하한율
+            estimate = features[2]     # 추정가격
+            pred_sashiritsu = top_ranges[0]["center"]
+            award_price = round(pred_sashiritsu * lower_rate * estimate)
+            award_min = round(result["statistics"]["q25"] * lower_rate * estimate)
+            award_max = round(result["statistics"]["q75"] * lower_rate * estimate) #
+
+            return {
+                "predBid": pred_sashiritsu,                             # 사정율
+                "award_price": award_price,                             # 원 단위 낙찰가
+                "award_min": award_min,                                 # 낙찰가 하한 (q25)
+                "award_max": award_max,                                 # 낙찰가 상한 (q75)
+                "top_ranges": top_ranges,
+                "statistics": result["statistics"]
+            }
+        else:
+            return {"error": "예측 실패", "predBid": 0}
+
+    except Exception as e:
+        return {"error": str(e), "predBid": 0}
+
+
+@app.get("/")
+def root():
+    """서버 상태 확인"""
+    return {
+        "status": "running",
+        "model": "TFT (Quantile Transformer)",
+        "features": ["top_ranges", "PDF generation", "Azure upload"]
+    }
 
 
 if __name__ == "__main__":

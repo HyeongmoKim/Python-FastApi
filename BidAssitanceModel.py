@@ -45,6 +45,10 @@ import json
 import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Annotated
+import zipfile
+import xml.etree.ElementTree as ET
+import zlib
+import olefile
 
 from pydantic import BaseModel, Field
 
@@ -58,7 +62,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages 
+from langgraph.graph.message import add_messages
 
 # ------------------------------
 # Utilities
@@ -126,70 +130,78 @@ def _load_module_from_py(py_path: str):
 
 
 
+def extract_text_from_hwp(hwp_path: str) -> str:
+    try:
+        f = olefile.OleFileIO(hwp_path)
+        dirs = f.listdir()
+        bodytext_dirs = [d for d in dirs if d[0].startswith('BodyText')]
+        full_text = []
+        for d in bodytext_dirs:
+            section = f.openstream(d).read()
+            try:
+                # HWP V5.0 이상은 zlib 압축을 사용함
+                decompressed = zlib.decompress(section, -15)
+                text = decompressed.decode('utf-16', errors='ignore')
+                full_text.append(text)
+            except:
+                continue
+        return "\n".join(full_text)
+    except Exception as e:
+        print(f"❌ HWP 추출 에러: {e}")
+        return ""
+
+def extract_text_from_hwpx(hwpx_path: str) -> str:
+    try:
+        with zipfile.ZipFile(hwpx_path, 'r') as zf:
+            content_files = [f for f in zf.namelist() if f.startswith('Contents/section') and f.endswith('.xml')]
+            full_text = []
+            for file in content_files:
+                with zf.open(file) as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    for t in root.iter():
+                        if t.tag.endswith('t') and t.text:
+                            full_text.append(t.text)
+            return "\n".join(full_text)
+    except Exception as e:
+        print(f"❌ HWPX 추출 에러: {e}")
+        return ""
+
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from a PDF file.
-
-    - Primary backend: pypdf (pure python)
-    - Fallback backend: PyMuPDF (fitz)
-
-    If the PDF is scanned (image-only), extracted text may be empty/short.
-    In that case, run OCR upstream and pass the OCR text to this pipeline.
-    """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
     text = ""
-    # Backend 1: pypdf
     try:
-        from pypdf import PdfReader  # type: ignore
+        from pypdf import PdfReader
         reader = PdfReader(pdf_path)
-        parts: List[str] = []
+        parts = []
         for page in reader.pages:
-            try:
-                parts.append(page.extract_text() or "")
-            except Exception:
-                parts.append("")
+            try: parts.append(page.extract_text() or "")
+            except: parts.append("")
         text = "\n\n".join(parts)
-    except Exception:
+    except:
         text = ""
-
-    # Backend 2: PyMuPDF (fallback)
     if len(_clean_whitespace(text)) < 50:
         try:
-            import fitz  # type: ignore
+            import fitz
             doc = fitz.open(pdf_path)
             parts = []
             for page in doc:
-                try:
-                    parts.append(page.get_text("text") or "")
-                except Exception:
-                    parts.append("")
+                try: parts.append(page.get_text("text") or "")
+                except: parts.append("")
             doc.close()
             text = "\n\n".join(parts)
-        except Exception:
+        except:
             pass
-
     text = text.replace("\x00", " ")
-    if len(_clean_whitespace(text)) < 50:
-        try:
-            import sys
-            sys.stderr.write(
-                "[WARN] PDF 텍스트 추출 결과가 매우 짧습니다. 스캔본 PDF일 가능성이 높습니다. "
-                "OCR(예: pytesseract+pdf2image) 적용을 고려하세요.\n"
-            )
-        except Exception:
-            pass
     return text
 
-
 def read_input_text(input_path: str) -> str:
-    """Read bid notice text from .txt or .pdf."""
     ext = os.path.splitext(input_path)[1].lower()
     if ext == ".pdf":
         return extract_text_from_pdf(input_path)
     with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
-
 
 
 def _callable_looks_like_wrapper(fn: Callable[..., Any]) -> bool:
@@ -325,6 +337,76 @@ class CallableAwardPricePredictor(AwardPricePredictor):
             "rationale": ["사용자 모델 출력 형식이 예상(dict/숫자)과 달라 해석할 수 없습니다."],
             "model": self.model_info,
         }
+
+class TFTPredictorWrapper(AwardPricePredictor):
+    """
+    TFT 모델 전용 래퍼 - top_ranges를 명시적으로 저장하고 관리
+
+    RAG_server.py의 TFTPredictorAdapter 객체를 받아서 래핑합니다.
+    예측 결과의 top_ranges를 내부에 저장하여 접근 가능하게 합니다.
+    """
+
+    def __init__(self, adapter):
+        """
+        Args:
+            adapter: TFTPredictorAdapter 인스턴스
+        """
+        self.adapter = adapter
+        self.top_ranges = None  # 마지막 예측의 top_ranges 저장
+        self.last_prediction = None  # 전체 예측 결과 저장
+
+    def predict(self, requirements: Dict[str, Any], retrieved_context: str) -> Dict[str, Any]:
+        """
+        TFT 모델로 예측 수행 및 결과 저장
+
+        Returns:
+            Dict containing:
+                - point_estimate: 가장 확률 높은 예측값
+                - top_ranges: 확률 높은 상위 구간들 (List)
+                - statistics: 통계 정보 (mean, median, q25, q75 등)
+                - confidence, rationale, model_type 등
+        """
+        try:
+            # TFTPredictorAdapter의 predict() 호출
+            result = self.adapter.predict(requirements, retrieved_context)
+
+            # 결과 저장
+            self.last_prediction = result
+
+            # top_ranges 명시적 저장
+            if isinstance(result, dict) and "top_ranges" in result:
+                self.top_ranges = result["top_ranges"]
+                print(f"✅ TFT 예측 완료 - top_ranges 저장: {len(self.top_ranges)}개 구간")
+                print(f"   최고 확률 구간 중심값: {self.top_ranges[0]['center']:,.0f}원")
+            else:
+                self.top_ranges = None
+                print("⚠️ 예측 결과에 top_ranges가 포함되지 않았습니다")
+
+            return result
+
+        except Exception as e:
+            print(f"❌ TFT 예측 오류: {e}")
+            self.last_prediction = None
+            self.top_ranges = None
+
+            return {
+                "currency": "KRW",
+                "point_estimate": 0,
+                "predicted_min": 0,
+                "predicted_max": 0,
+                "confidence": "error",
+                "rationale": f"TFT 모델 예측 중 오류 발생: {str(e)}",
+                "model_type": "TFT (error)",
+                "error": str(e)
+            }
+
+    def get_top_ranges(self) -> Optional[List[Dict[str, Any]]]:
+        """저장된 top_ranges 반환"""
+        return self.top_ranges
+
+    def get_last_prediction(self) -> Optional[Dict[str, Any]]:
+        """마지막 예측 결과 전체 반환"""
+        return self.last_prediction
 
 
 class CNN1DAwardPricePredictor(AwardPricePredictor):
@@ -747,6 +829,7 @@ class BidRAGPipeline:
             award_hidden: int = 64,
             award_dropout: float = 0.1,
             award_predict_fn: Optional[Callable[[Dict[str, Any], str], Any]] = None,  # ★ 외부 함수 주입용
+            award_predictor_instance: Optional[Any] = None,
     ):
         load_api_keys("api_key.txt")
 
@@ -767,6 +850,7 @@ class BidRAGPipeline:
             award_hidden=award_hidden,
             award_dropout=award_dropout,
             award_predict_fn=award_predict_fn,
+            award_predictor_instance=award_predictor_instance,
         )
 
         self.graph = self._build_graph()
@@ -780,7 +864,12 @@ class BidRAGPipeline:
             award_hidden: int,
             award_dropout: float,
             award_predict_fn: Optional[Callable[[Dict[str, Any], str], Any]],
+            award_predictor_instance: Optional[Any] = None,
     ) -> AwardPricePredictor:
+
+        if award_predictor_instance is not None:
+            print("✅ BidRAGPipeline: TFT Adapter 객체로 초기화 (top_ranges 명시적 관리)")
+            return TFTPredictorWrapper(award_predictor_instance)
 
         # ★ [핵심 수정] 외부에서 Transformer 어댑터 같은 함수가 들어오면 바로 리턴!
         if award_predict_fn is not None:
@@ -789,6 +878,7 @@ class BidRAGPipeline:
                 predict_fn=award_predict_fn,
                 model_info={"type": "external_injected", "name": "TransformerAdapter"}
             )
+
 
         # 아래는 기존의 1DCNN 로딩 로직 (award_predict_fn이 없을 때만 실행됨)
         if not award_model_path:
@@ -1051,12 +1141,16 @@ class BidRAGPipeline:
                 "필수 섹션(순서 유지):\n"
                 "# 1. 공고 요약\n"
                 "# 2. 참가자격/실적/제출서류 체크리스트\n"
-                "# 3. 낙찰가 예측(범위/포인트/근거/리스크)\n"
+                "# 3. 낙찰가 예측(범위/포인트/근거/)\n"
+                # --- 추가 및 수정된 부분 ---
+                "   - 이 섹션에는 반드시 '### 사정율 구간에 따른 상위 3개의 확률'이라는 소제목을 포함하라.\n"
+                "   - 전달된 데이터 중 'top_ranges'에 있는 상위 3개 구간의 사정율 범위와 확률(%) 정보를 가독성 있게 작성하라.\n"
+                "   - 사정율은 소수점 둘째 자리까지 표기하고, 각 구간별 확률값(%)을 명시하라.\n"
+                # ------------------------
                 "# 4. 권고 액션(다음 72시간 To-Do)\n\n"
                 "제약: 근거가 불충분하면 '가정'으로 명시하고 추가 수집 항목을 제시하라."
             )
         )
-
         ctx = SystemMessage(content=(
         f"[추출된 요구사항]\n{reqs_json}\n\n"
         f"[낙찰가 예측 모델 결과]\n{pred_json}"
