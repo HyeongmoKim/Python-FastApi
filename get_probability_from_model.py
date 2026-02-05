@@ -46,7 +46,7 @@ class QuantileTransformerRegressor(nn.Module):
 class ProbabilityPredictor:
     """TFT 4-Feature 모델을 사용한 확률 예측 클래스"""
 
-    def __init__(self, model_path='./results_tft_4feat/best_model.pt'):
+    def __init__(self, model_path='./results_transformer_4feat/best_model.pt'):
         self.model_path = model_path
         self.device = device
         self.quantiles = np.linspace(0.001, 0.999, 999)
