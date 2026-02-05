@@ -47,10 +47,28 @@ class ProbabilityPredictor:
     """TFT 4-Feature 모델을 사용한 확률 예측 클래스"""
 
     def __init__(self, model_path='./results_transformer_4feat/best_model.pt'):
-        self.model_path = model_path
-        self.device = device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 2. [핵심 수정] 모델 경로 절대 경로화
+        if model_path is None:
+            # 현재 소스 파일(get_probability_from_model.py)의 위치를 기준으로 경로 설정
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+
+            # ⚠️ 주의: 실제 폴더명이 'results_tft_4feat'인지 'results_transformer_4feat'인지 꼭 확인하세요.
+            # 사용자가 올려준 스니펫에 맞춰 'results_transformer_4feat'로 설정했습니다.
+            self.model_path = os.path.join(base_dir, 'results_transformer_4feat', 'best_model.pt')
+        else:
+            # 입력된 경로가 상대 경로일 경우를 대비해 절대 경로로 변환
+            self.model_path = os.path.abspath(model_path)
+
+        # 3. 디버깅 로그 (클라우드 로그에서 경로 확인용)
+        print(f"[ProbabilityPredictor] Target Model Path: {self.model_path}")
+        print(f"[ProbabilityPredictor] File Exists Check: {os.path.exists(self.model_path)}")
+
         self.quantiles = np.linspace(0.001, 0.999, 999)
         self.feature_names = ['예가범위', '낙찰하한율', '추정가격', '기초금액']
+
+        # 4. 모델 로드
         self.model = self._load_model()
         self.scaler = None
 
